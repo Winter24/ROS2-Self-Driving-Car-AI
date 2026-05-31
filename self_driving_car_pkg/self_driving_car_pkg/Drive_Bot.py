@@ -418,7 +418,7 @@ class Car:
         # Translate [ Real World angle and speed ===>> ROS Car Control Range ]
         Angle=interp(Angle,[-60,60],[0.8,-0.8])
         if (Speed!=0):
-            Speed=interp(Speed,[30,90],[1,2])
+            Speed=interp(Speed,[30,90],[0.3,0.8])
 
         Speed = float(Speed)
 

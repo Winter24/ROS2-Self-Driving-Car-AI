@@ -43,7 +43,7 @@ class Video_feed_in(Node):
 
         super().__init__('video_subscriber')
         self.subscriber = self.create_subscription(Image,'/camera/image_raw',self.process_data,10)
-        self.publisher = self.create_publisher(Twist, '/diff_cont/cmd_vel_unstamped', 40)
+        self.publisher = self.create_publisher(Twist, '/cmd_vel', 40)
 
         self.velocity = Twist()
         self.bridge   = CvBridge() # converting ros images to opencv data
@@ -59,7 +59,7 @@ class Video_feed_in(Node):
         self.sat_view = None 
 
         # [NEW]: Subscrbing to receive the robot pose in simulation
-        self.pose_subscriber = self.create_subscription(Odometry,'/diff_cont/odom',self.navigator.bot_motionplanner.get_pose,10)
+        self.pose_subscriber = self.create_subscription(Odometry,'/odom',self.navigator.bot_motionplanner.get_pose,10)
 
         self.prius_dashcam = None
 
