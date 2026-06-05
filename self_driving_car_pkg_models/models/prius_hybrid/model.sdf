@@ -591,6 +591,91 @@
     </joint>
 
 
+<!-- 3D LiDAR VLP-16 mounted on Prius roof -->
+    <link name='velodyne'>
+      <!-- Prius model axes: x=left/right, y=front/back, z=up.
+           Mounted near center of roof. Adjust z if it intersects the roof. -->
+      <pose>0 0.25 1.58 0 0 0</pose>
+      <inertial>
+        <mass>0.83</mass>
+        <inertia>
+          <ixx>0.000908059425</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.000908059425</iyy>
+          <iyz>0</iyz>
+          <izz>0.0011049624</izz>
+        </inertia>
+      </inertial>
+      <visual name='visual'>
+        <geometry>
+          <cylinder>
+            <radius>0.05</radius>
+            <length>0.04</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <script>
+            <uri>file://media/materials/scripts/gazebo.material</uri>
+            <name>Gazebo/Black</name>
+          </script>
+        </material>
+      </visual>
+      <collision name='collision'>
+        <geometry>
+          <cylinder>
+            <radius>0.0516</radius>
+            <length>0.0717</length>
+          </cylinder>
+        </geometry>
+      </collision>
+
+      <sensor name='velodyne-VLP16' type='ray'>
+        <pose>0 0 0 0 0 0</pose>
+        <visualize>false</visualize>
+        <update_rate>3</update_rate>
+        <ray>
+          <scan>
+            <horizontal>
+              <samples>360</samples>
+              <resolution>1</resolution>
+              <min_angle>-3.1415926535897931</min_angle>
+              <max_angle>3.1415926535897931</max_angle>
+            </horizontal>
+            <vertical>
+              <samples>16</samples>
+              <resolution>1</resolution>
+              <min_angle>-0.2617993877991494</min_angle>
+              <max_angle>0.2617993877991494</max_angle>
+            </vertical>
+          </scan>
+          <range>
+            <min>0.055</min>
+            <max>50.0</max>
+            <resolution>0.001</resolution>
+          </range>
+          <noise>
+            <type>gaussian</type>
+            <mean>0.0</mean>
+            <stddev>0.0</stddev>
+          </noise>
+        </ray>
+        <plugin name='gazebo_ros_laser_controller' filename='libgazebo_ros_velodyne_laser.so'>
+          <topicName>/points_raw</topicName>
+          <frameName>velodyne</frameName>
+          <min_range>0.9</min_range>
+          <max_range>80.0</max_range>
+          <gaussianNoise>0.008</gaussianNoise>
+        </plugin>
+      </sensor>
+    </link>
+
+    <joint name='velodyne_joint' type='fixed'>
+      <parent>chassis</parent>
+      <child>velodyne</child>
+    </joint>
+
+
   </model>
 
 </sdf>
