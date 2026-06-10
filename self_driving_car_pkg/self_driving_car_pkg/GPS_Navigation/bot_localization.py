@@ -26,6 +26,7 @@ Date :
 '''
 import cv2
 import numpy as np
+import os
 
 from .utilities import ret_smallest_obj,ret_largest_obj
 from . import config
@@ -58,6 +59,13 @@ class bot_localizer():
 
         # [NEW]: Container to store location of Car in relation to road nework
         self.loc_car_wrt_rdntwork = []
+
+        # Track the selected car contour in satellite-view pixel coordinates.
+        # The original code used the largest foreground contour every frame,
+        # which often selects another moving/changed object and makes GPS start
+        # jump to the wrong road. Keep a visual track instead.
+        self.last_car_sat_xy = None
+        self.loc_debug_counter = 0
 
 
     @staticmethod
@@ -133,6 +141,49 @@ class bot_localizer():
         rois_mask = cv2.drawContours(edges_temp, cnts_mask, -1, 255,-1)
 
         return rois_mask,cnts_mask
+
+    @staticmethod
+    def extract_road_mask_from_dark_asphalt(frame):
+        """Extract road area from the top-down RGB image.
+
+        The previous code built road_network_mask from Canny edges/contours. That
+        gives mostly building/road borders, so thinning produces a skeleton that
+        follows map borders and random object edges instead of road centerlines.
+        Roads in this Gazebo map are dark asphalt, so threshold dark pixels and
+        keep the largest connected dark component as the road network.
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        v = hsv[:, :, 2]
+
+        # Dark asphalt. Keep threshold conservative to avoid roofs/shadows as much
+        # as possible; largest connected component filters most remaining objects.
+        dark = cv2.inRange(v, 0, 75)
+
+        # Remove tiny dark vehicles/noise, then bridge lane gaps and intersections.
+        dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+        dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (13, 13)))
+
+        cnts = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[1]
+        road_mask = np.zeros_like(dark)
+        road_cnt = None
+        if len(cnts) > 0:
+            road_cnt = max(cnts, key=cv2.contourArea)
+            cv2.drawContours(road_mask, [road_cnt], 0, 255, -1)
+            # Smooth/fill the final road area.
+            road_mask = cv2.morphologyEx(road_mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)))
+
+        return road_mask, road_cnt, dark
+
+    @staticmethod
+    def save_pipeline_viz(name, img):
+        if not getattr(config, "visualize_pipeline", False):
+            return
+        try:
+            os.makedirs(getattr(config, "visualize_pipeline_dir", "/tmp/gps_nav_debug"), exist_ok=True)
+            cv2.imwrite(os.path.join(config.visualize_pipeline_dir, name + ".png"), img)
+        except Exception as e:
+            print("[GPS Viz Debug] failed", name, e)
 
     # Program to find most frequent element in a list
     @staticmethod
@@ -235,17 +286,22 @@ class bot_localizer():
             self.bg_model = cv2.bitwise_and(Ground_replica, Ground_replica,mask = car_mask)
             self.bg_model = cv2.bitwise_or(self.bg_model, frame_car_remvd)
         
-        # Step 2: Extracting the maze (Frame of Refrence) Maze Entry on Top
+        # Step 2: Extracting the maze (Frame of Reference) Maze Entry on Top
         
-        # a) Extracting only road_network from rois_masks
-        road_network_mask, road_network_cnt = ret_largest_obj(rois_mask)
-        # b) Fetching edges of only road network
-        road_network_edges = cv2.bitwise_and(edges_canny, edges_canny,mask=road_network_mask)
+        # Extract road area from dark asphalt, not from Canny object edges.
+        # Edge-based extraction creates a skeleton that follows borders/buildings
+        # and does not match the GPS map roads.
+        road_network_mask, road_network_cnt, dark_asphalt_mask = self.extract_road_mask_from_dark_asphalt(frame)
+        if road_network_cnt is None or cv2.contourArea(road_network_cnt) < 1000:
+            print("[GPS Mapping Debug] WARNING: dark-asphalt road extraction failed; falling back to old edge method")
+            road_network_mask, road_network_cnt = ret_largest_obj(rois_mask)
+            road_network_edges = cv2.bitwise_and(edges_canny, edges_canny,mask=road_network_mask)
+            road_network_mask = self.refine_road_mask(road_network_edges,road_network_mask)
 
-        # c( Removing holes wrongly considered to be part of roads network
-        road_network_mask = self.refine_road_mask(road_network_edges,road_network_mask)
+        self.save_pipeline_viz("00_dark_asphalt_mask", dark_asphalt_mask)
+        self.save_pipeline_viz("00_road_area_mask", road_network_mask)
 
-        # d) Retrieving region where road network lie
+        # Retrieving region where road network lies
         [X,Y,W,H] = cv2.boundingRect(road_network_cnt)
 
         # e) Crop out only road_network from complete mask
@@ -266,6 +322,112 @@ class bot_localizer():
             cv2.imshow("1d. bg_model",self.bg_model)
             cv2.imshow("2. maze_og",self.maze_og)
             cv2.waitKey(0)
+
+    @staticmethod
+    def contour_centroid_xy(cnt):
+        M = cv2.moments(cnt)
+        if M['m00'] == 0:
+            (cx, cy), _ = cv2.minEnclosingCircle(cnt)
+            return (int(cx), int(cy))
+        return (int(M['m10']/M['m00']), int(M['m01']/M['m00']))
+
+    def select_car_contour(self, change_mask):
+        """Select the Prius foreground contour robustly.
+
+        Avoid choosing the largest changed blob. On this map the largest
+        foreground can be another vehicle/shadow/road artifact, causing GPS
+        Graph.start to be far from the real car. First frame uses a spawn prior
+        for launch_sim (car near lower middle of SatView); later frames track
+        the contour nearest to the previous car centroid.
+        """
+        cnts = cv2.findContours(change_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[1]
+        if len(cnts) == 0:
+            return None, None
+
+        h, w = change_mask.shape[:2]
+        # Empirical launch_sim spawn prior in SatView pixels. The view is usually
+        # portrait 720x1280; ratios keep it resolution-independent.
+        if self.last_car_sat_xy is None:
+            prior = np.array([0.38 * w, 0.44 * h], dtype=float)
+        else:
+            prior = np.array(self.last_car_sat_xy, dtype=float)
+
+        candidates = []
+        for cnt in cnts:
+            area = cv2.contourArea(cnt)
+            if area < 8:
+                continue
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            # Reject very large scene changes; the Prius is a compact object in
+            # the overhead view. Keep this loose to survive scale changes.
+            if area > 6000 or bw > 180 or bh > 180:
+                continue
+            cx, cy = self.contour_centroid_xy(cnt)
+            dist = float(np.linalg.norm(np.array([cx, cy], dtype=float) - prior))
+            # Prefer compact, not-too-tiny contours near the prior/last location.
+            area_penalty = 0.0 if area >= 20 else (20 - area) * 4.0
+            score = dist + area_penalty
+            candidates.append((score, area, (cx, cy), cnt))
+
+        if not candidates:
+            # Fallback: choose nearest contour to prior, still better than largest.
+            for cnt in cnts:
+                area = cv2.contourArea(cnt)
+                if area < 3:
+                    continue
+                cx, cy = self.contour_centroid_xy(cnt)
+                dist = float(np.linalg.norm(np.array([cx, cy], dtype=float) - prior))
+                candidates.append((dist, area, (cx, cy), cnt))
+
+        if not candidates:
+            return None, None
+
+        candidates.sort(key=lambda item: item[0])
+        score, area, centroid, cnt = candidates[0]
+
+        # If a previous/manual START position exists, never allow the tracker to
+        # jump to a far-away changed object. In manual waypoint mode the user has
+        # explicitly told us where the car starts, so a contour hundreds of
+        # pixels away is almost certainly a wrong vehicle/shadow/building edge.
+        # Keep the previous position instead; when the real car moves, normal
+        # frame-to-frame motion should remain close to this prior.
+        forced_prior = False
+        max_track_jump_px = int(getattr(config, "gps_localizer_max_jump_px", 120))
+        if self.last_car_sat_xy is not None and score > max_track_jump_px:
+            forced_prior = True
+            centroid = (int(prior[0]), int(prior[1]))
+            area = 80.0
+            old_score = score
+            score = 0.0
+            car_mask = np.zeros_like(change_mask)
+            cv2.circle(car_mask, centroid, 7, 255, -1)
+            forced_cnts = cv2.findContours(car_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[1]
+            cnt = forced_cnts[0]
+            print("[GPS Loc Debug] rejected far contour; keep prior sat_xy={} nearest_wrong_dist={:.1f}px max_jump={}".format(
+                centroid, old_score, max_track_jump_px))
+        # Important for launch_sim: sometimes background extraction removes the
+        # wrong small object, so change_mask initially contains only that wrong
+        # object. If the first selected contour is very far from the known spawn
+        # area, use the spawn prior directly instead of locking onto the wrong car.
+        elif self.last_car_sat_xy is None and score > 180:
+            forced_prior = True
+            centroid = (int(prior[0]), int(prior[1]))
+            area = 80.0
+            score = 0.0
+            car_mask = np.zeros_like(change_mask)
+            cv2.circle(car_mask, centroid, 7, 255, -1)
+            forced_cnts = cv2.findContours(car_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[1]
+            cnt = forced_cnts[0]
+        else:
+            car_mask = np.zeros_like(change_mask)
+            cv2.drawContours(car_mask, [cnt], 0, 255, -1)
+
+        self.last_car_sat_xy = centroid
+        self.loc_debug_counter += 1
+        if self.loc_debug_counter <= 20 or self.loc_debug_counter % 30 == 0:
+            print("[GPS Loc Debug] selected car sat_xy={} area={:.1f} score={:.1f} prior={} contours={}{}".format(
+                centroid, area, score, tuple(prior.astype(int)), len(cnts), " FORCED_SPAWN_PRIOR" if forced_prior else ""))
+        return car_mask, cnt
 
     @staticmethod
     def get_centroid(cnt):
@@ -321,7 +483,10 @@ class bot_localizer():
         change = cv2.absdiff(curr_frame, self.bg_model)
         change_gray = cv2.cvtColor(change, cv2.COLOR_BGR2GRAY)
         change_mask = cv2.threshold(change_gray, 15, 255, cv2.THRESH_BINARY)[1]
-        car_mask, car_cnt = ret_largest_obj(change_mask)
+        car_mask, car_cnt = self.select_car_contour(change_mask)
+        if car_cnt is None:
+            print("[GPS Loc Debug] WARNING: no car contour found; keeping previous location")
+            return
 
         # [NEW]: Storing Rectangle bounding the localized car for use as a Base Unit in Mapping
         x,y,w,h = cv2.boundingRect(car_cnt)
@@ -329,6 +494,8 @@ class bot_localizer():
 
         # Step 3: Fetching the (relative) location of car.
         self.get_car_loc(car_cnt,car_mask)
+        if self.loc_debug_counter <= 20 or self.loc_debug_counter % 30 == 0:
+            print("[GPS Loc Debug] loc_car road_xy={} sat_xy={}".format(self.loc_car, self.last_car_sat_xy))
 
         # Drawing bounding circle around detected car
         center, radii = cv2.minEnclosingCircle(car_cnt)

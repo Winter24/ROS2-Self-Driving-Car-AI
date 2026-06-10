@@ -29,9 +29,24 @@ Date :
 '''
 import cv2
 import numpy as np
+import os
 from numpy import sqrt
+from collections import deque
 
 from . import config
+
+def _gps_viz(name, img):
+    if not getattr(config, "visualize_pipeline", False):
+        return
+    try:
+        os.makedirs(getattr(config, "visualize_pipeline_dir", "/tmp/gps_nav_debug"), exist_ok=True)
+        cv2.imwrite(os.path.join(config.visualize_pipeline_dir, name + ".png"), img)
+        cv2.namedWindow("GPS DEBUG - " + name, cv2.WINDOW_NORMAL)
+        cv2.imshow("GPS DEBUG - " + name, img)
+        cv2.waitKey(1)
+    except Exception as e:
+        print("[GPS Viz Debug] failed", name, e)
+
 class bot_pathplanner():
 
     def __init__(self):
@@ -47,6 +62,199 @@ class bot_pathplanner():
     @staticmethod
     def cords_to_pts(cords):
       return [cord[::-1] for cord in cords]
+
+    @staticmethod
+    def fallback_skeleton_path(maze, start, end):
+        """Pixel-level BFS fallback on a repaired road skeleton.
+
+        The reduced interest-point graph can be disconnected in this city map.
+        The raw skeleton can also have 1-5 pixel gaps at intersections/occlusions,
+        so BFS first tries the raw skeleton, then progressively dilated/closed
+        versions. start/end are graph coordinates in (row, col). Returns path in
+        the same (row, col) convention.
+        """
+        if maze is None or not hasattr(maze, 'shape'):
+            return []
+        rows, cols = maze.shape[:2]
+        sr, sc = int(start[0]), int(start[1])
+        er, ec = int(end[0]), int(end[1])
+        if not (0 <= sr < rows and 0 <= sc < cols and 0 <= er < rows and 0 <= ec < cols):
+            return []
+
+        def nearest_on_mask(mask, rc):
+            r, c = rc
+            if mask[r, c] > 0:
+                return (r, c)
+            ys, xs = np.where(mask > 0)
+            if xs.size == 0:
+                return None
+            d2 = (ys - r) ** 2 + (xs - c) ** 2
+            idx = int(np.argmin(d2))
+            return (int(ys[idx]), int(xs[idx]))
+
+        def bfs(mask, s_rc, e_rc):
+            s2 = nearest_on_mask(mask, s_rc)
+            e2 = nearest_on_mask(mask, e_rc)
+            if s2 is None or e2 is None:
+                return []
+            q = deque([s2])
+            parent = {s2: None}
+            nbrs = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]
+            while q:
+                r, c = q.popleft()
+                if (r, c) == e2:
+                    break
+                for dr, dc in nbrs:
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < rows and 0 <= nc < cols and mask[nr, nc] > 0 and (nr, nc) not in parent:
+                        parent[(nr, nc)] = (r, c)
+                        q.append((nr, nc))
+            if e2 not in parent:
+                return []
+            path = []
+            cur = e2
+            while cur is not None:
+                path.append(cur)
+                cur = parent[cur]
+            path = path[::-1]
+            # Force original snapped start/end endpoints for consistency.
+            if path:
+                path[0] = (sr, sc)
+                path[-1] = (er, ec)
+            return path
+
+        base = cv2.threshold(maze, 0, 255, cv2.THRESH_BINARY)[1]
+        def same_street_path():
+            # If start and destination are almost on the same vertical/horizontal
+            # street, use a conservative straight route between the two snapped
+            # road points. This is specifically for cases like (52,402)->(356,418):
+            # the interest-point graph is disconnected, but both points are on the
+            # same road corridor. We do NOT use this for diagonal/cross-block goals.
+            dx = abs(sc - ec)
+            dy = abs(sr - er)
+            same_vertical = dx <= 45 and dy > 10
+            same_horizontal = dy <= 45 and dx > 10
+            # Destination may snap to the other side/lane of the same vertical
+            # street (e.g. dr/dc=(304,86)). In that case do a Manhattan route:
+            # follow the current street first, then a short lateral segment near
+            # the destination/intersection. This avoids drawing a diagonal line.
+            corridor_vertical = dx <= 120 and dy > 10
+            corridor_horizontal = dy <= 120 and dx > 10
+            if not (same_vertical or same_horizontal or corridor_vertical or corridor_horizontal):
+                print("[GPS Path Debug] same-street fallback skipped; dr/dc=({}, {})".format(dy, dx))
+                return []
+
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35))
+            near_road = cv2.dilate(base, kernel, iterations=1)
+
+            def line_pts(a, b):
+                ar, ac = a
+                br, bc = b
+                n = max(abs(br-ar), abs(bc-ac)) + 1
+                if n < 2:
+                    return [a]
+                return [(int(round(ar + (br-ar) * (i/float(n-1)))),
+                         int(round(ac + (bc-ac) * (i/float(n-1))))) for i in range(n)]
+
+            def score(pts):
+                if len(pts) < 2:
+                    return 0.0
+                hits = sum(1 for r, c in pts if 0 <= r < rows and 0 <= c < cols and near_road[r, c] > 0)
+                return hits / float(len(pts))
+
+            if same_vertical or same_horizontal:
+                candidates = [("straight", line_pts((sr, sc), (er, ec)))]
+            elif corridor_vertical:
+                # Prefer going along the start column, then laterally to dest.
+                mid1 = (er, sc)
+                mid2 = (sr, ec)
+                candidates = [
+                    ("vertical_then_lateral", line_pts((sr, sc), mid1) + line_pts(mid1, (er, ec))[1:]),
+                    ("lateral_then_vertical", line_pts((sr, sc), mid2) + line_pts(mid2, (er, ec))[1:]),
+                ]
+            else:
+                mid1 = (sr, ec)
+                mid2 = (er, sc)
+                candidates = [
+                    ("horizontal_then_lateral", line_pts((sr, sc), mid1) + line_pts(mid1, (er, ec))[1:]),
+                    ("lateral_then_horizontal", line_pts((sr, sc), mid2) + line_pts(mid2, (er, ec))[1:]),
+                ]
+
+            # For a vertical street corridor, prefer going along the current
+            # lane/column first, then moving laterally near the destination. A
+            # pure near-road score can choose lateral_then_vertical and draw the
+            # route toward the far right edge.
+            if corridor_vertical:
+                best_name, pts = candidates[0]  # vertical_then_lateral
+            elif corridor_horizontal:
+                best_name, pts = candidates[0]
+            else:
+                best_name, pts = max(candidates, key=lambda item: score(item[1]))
+            ratio = score(pts)
+            if ratio < 0.20:
+                print("[GPS Path Debug] same-street fallback rejected; near-road ratio={:.2f}, dr/dc=({}, {})".format(ratio, dy, dx))
+                return []
+
+            sampled = pts[::max(1, len(pts)//120)]
+            if sampled[-1] != pts[-1]:
+                sampled.append(pts[-1])
+            sampled[0] = (sr, sc)
+            sampled[-1] = (er, ec)
+            print("[GPS Path Debug] same-street fallback used {}; len={}, near-road ratio={:.2f}, dr/dc=({}, {})".format(best_name, len(sampled), ratio, dy, dx))
+            viz = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+            pts_xy = [(c, r) for r, c in sampled]
+            for i in range(len(pts_xy)-1):
+                cv2.line(viz, pts_xy[i], pts_xy[i+1], (0,0,255), 2)
+            cv2.circle(viz, pts_xy[0], 7, (255,0,0), 2)
+            cv2.circle(viz, pts_xy[-1], 9, (0,255,0), 2)
+            cv2.putText(viz, "fallback: " + best_name, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+            _gps_viz("04_fallback_same_street", viz)
+            return sampled
+
+        same_street = same_street_path()
+        if len(same_street) >= 2:
+            return same_street
+
+        masks = [("raw", base)]
+        # Keep fallback conservative. Large dilation/closing can merge separate
+        # streets across blocks and creates fake diagonal routes through houses.
+        # Only bridge tiny skeletonization gaps; if this fails, report no path
+        # instead of drawing an invalid line.
+        for k in (3, 5):
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            repaired = cv2.morphologyEx(base, cv2.MORPH_CLOSE, kernel)
+            masks.append(("repair_k{}".format(k), repaired))
+
+        path = []
+        used = "none"
+        for name, mask in masks:
+            path = bfs(mask, (sr, sc), (er, ec))
+            if len(path) >= 2:
+                used = name
+                break
+
+        if len(path) < 2:
+            return []
+
+        print("[GPS Path Debug] skeleton BFS used mask =", used, "raw_len=", len(path))
+        viz = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+        pts_xy = [(c, r) for r, c in path]
+        for i in range(len(pts_xy)-1):
+            cv2.line(viz, pts_xy[i], pts_xy[i+1], (0,0,255), 1)
+        cv2.circle(viz, pts_xy[0], 7, (255,0,0), 2)
+        cv2.circle(viz, pts_xy[-1], 9, (0,255,0), 2)
+        cv2.putText(viz, "BFS mask: " + used, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+        _gps_viz("04_fallback_bfs", viz)
+
+        # Downsample long pixel path to keep navigation/display lightweight, while
+        # preserving start and end.
+        if len(path) > 250:
+            step = max(1, len(path) // 250)
+            sampled = path[::step]
+            if sampled[-1] != path[-1]:
+                sampled.append(path[-1])
+            path = sampled
+        return path
 
     def draw_path_on_maze(self,maze,shortest_path_pts,method):
         
@@ -80,6 +288,7 @@ class bot_pathplanner():
         elif method == "a_star":
             self.astar.shortest_path_overlayed = maze_bgr
             
+        _gps_viz("05_path_" + method, maze_bgr)
         self.img_shortest_path = maze_bgr.copy()
 
     def find_path_nd_display(self,graph,start,end,maze,method = "DFS"):
@@ -126,6 +335,25 @@ class bot_pathplanner():
             
             path_to_display = self.astar.shortest_path
             Path_str = "\nShortest "+ Path_str
+
+        if path_to_display is None or len(path_to_display) < 2:
+            print("[GPS Path Debug] graph path unavailable; trying skeleton BFS fallback")
+            fallback_path = self.fallback_skeleton_path(maze, start, end)
+            if len(fallback_path) >= 2:
+                print("[GPS Path Debug] skeleton fallback path length =", len(fallback_path))
+                path_to_display = fallback_path
+                if method == "dijisktra":
+                    self.dijisktra.shortest_path = fallback_path
+                    self.dijisktra.shortestpath_found = True
+                elif method == "a_star":
+                    self.astar.shortest_path = fallback_path
+                    self.astar.shortestpath_found = True
+            else:
+                print("[GPS Path Debug] skeleton fallback failed; no valid route will be drawn")
+                self.path_to_goal = -1
+                self.img_shortest_path = cv2.cvtColor(maze, cv2.COLOR_GRAY2BGR)
+                self.choosen_route = np.zeros_like(self.img_shortest_path)
+                return
 
         pathpts_to_display = self.cords_to_pts(path_to_display)
         self.path_to_goal = pathpts_to_display
@@ -436,7 +664,14 @@ class dijisktra():
                 break
         
         shortest_path = []
-        self.ret_shortestroute(parent, start_idx,self.vrtxs2idxs[end],shortest_path)
+        end_idx = self.vrtxs2idxs[end]
+        if end_idx != start_idx and parent[end_idx] == -1:
+            print("[GPS Path Debug] WARNING: graph route not connected; no parent chain from start to end")
+            self.shortest_path = []
+            self.shortestpath_found = False
+            return
+
+        self.ret_shortestroute(parent, start_idx,end_idx,shortest_path)
         
         # Return route (reversed) to start from the beginned
         self.shortest_path = shortest_path[::-1]
@@ -537,7 +772,14 @@ class a_star(dijisktra):
                 break
         
         shortest_path = []
-        self.ret_shortestroute(parent, start_idx,self.vrtxs2idxs[end],shortest_path)
+        end_idx = self.vrtxs2idxs[end]
+        if end_idx != start_idx and parent[end_idx] == -1:
+            print("[GPS Path Debug] WARNING: graph route not connected; no parent chain from start to end")
+            self.shortest_path = []
+            self.shortestpath_found = False
+            return
+
+        self.ret_shortestroute(parent, start_idx,end_idx,shortest_path)
         
         # Return route (reversed) to start from the beginned
         self.shortest_path = shortest_path[::-1]

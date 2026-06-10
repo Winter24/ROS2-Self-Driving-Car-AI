@@ -48,7 +48,10 @@ class Video_feed_in(Node):
         self.velocity = Twist()
         self.bridge   = CvBridge() # converting ros images to opencv data
         self.Debug    = Debugging()
-        self.Car      = Car()
+        # Lane-following only for city worlds without traffic lights/signs.
+        # Inc_TL=False disables Traffic Light Detection.
+        # Inc_LT=False disables Traffic Sign Detection / Sign Classification.
+        self.Car      = Car(Inc_TL=False, Inc_LT=False)
 
         # creating object of navigator class
         self.navigator = Navigator()
@@ -62,6 +65,9 @@ class Video_feed_in(Node):
         self.pose_subscriber = self.create_subscription(Odometry,'/odom',self.navigator.bot_motionplanner.get_pose,10)
 
         self.prius_dashcam = None
+
+        # True after GPS_Navigation reports the final destination is reached.
+        self.destination_reached = False
 
         # [NEW] Steering Animation Variables
         self.x_vals = []
@@ -112,28 +118,82 @@ class Video_feed_in(Node):
         frame = self.bridge.imgmsg_to_cv2(data,'bgr8') # performing conversion
 
         if config.enable_SatNav and self.sat_view is not None:
-            # Adding prius_dashcam to be passed as an argument to navigat_to_home
-            #       So that we can see sdc_First Person View of navigating to home
-            if self.prius_dashcam is None:
+            # GPS Nav mode: GPS provides route/waypoint intent, but front-camera
+            # road following owns lane centering whenever it has a valid road
+            # mask. This keeps the car in-lane and leaves room for future camera
+            # obstacle avoidance.
+            lane_angle = 0.0
+            lane_speed = 0.0
+            lane_valid = False
+            if getattr(config, "gps_lane_assist_enabled", False):
+                try:
+                    lane_angle, lane_speed, self.prius_dashcam = self.Car.driveCar(frame)
+                    lane_valid = bool(getattr(self.Car.Control_, "lane_valid", False))
+                    if lane_valid:
+                        lane_angle = max(-float(getattr(config, "gps_lane_assist_max_angular", 0.45)),
+                                         min(float(getattr(config, "gps_lane_assist_max_angular", 0.45)), float(lane_angle)))
+                    else:
+                        lane_angle = 0.0
+                        lane_valid = False
+                except Exception as e:
+                    lane_angle = 0.0
+                    lane_valid = False
+                    if config.debugging:
+                        print('[GPS Lane Assist Debug] camera lane assist failed:', e)
+            else:
                 self.prius_dashcam = frame
+
+            # Draw GPS UI after lane assist has produced the processed camera
+            # frame, otherwise Bot View only shows the raw dashcam image.
             self.navigator.navigate_to_home(self.sat_view,self.prius_dashcam)
 
-        # [NEW]: Self Drive in Action being displayed in prius_dashcam member variable
-        Angle,Speed,self.prius_dashcam = self.Car.driveCar(frame)
+            if config.engines_on:
+                gps_angle = float(self.navigator.bot_motionplanner.vel_angular_z)
+                if lane_valid:
+                    lane_w = float(getattr(config, "gps_lane_assist_weight", 0.90))
+                    gps_bias_w = float(getattr(config, "gps_lane_assist_gps_bias_weight", 0.15))
+                    # Camera owns steering when lane detection is valid. Keep
+                    # gps_bias_w at 0 unless you explicitly want GPS to nudge
+                    # turns; otherwise GPS can fight lane-centering corrections.
+                    self.velocity.angular.z = (lane_w * float(lane_angle)) + (gps_bias_w * gps_angle)
+                    self.velocity.linear.x = float(getattr(config, "gps_lane_assist_camera_speed", 0.45))
+                else:
+                    self.velocity.angular.z = gps_angle
+                    self.velocity.linear.x = min(float(self.navigator.bot_motionplanner.vel_linear_x),
+                                                 float(getattr(config, "gps_lane_assist_gps_fallback_speed", 0.25)))
+                max_ang = float(getattr(config, "gps_nav_max_angular_cmd", 1.0))
+                self.velocity.angular.z = max(-max_ang, min(max_ang, self.velocity.angular.z))
+            else:
+                self.velocity.angular.z = 0.0
+                self.velocity.linear.x = 0.0
 
-        # [NEW]: No Road Speed Limit or No Intersection... Speed is dictated by Sat Nav
-        if config.enable_SatNav:
-            if ((self.Car.Tracked_class=="Unknown") and (self.Car.Traffic_State=="Unknown")):
-                Speed = float(self.navigator.bot_motionplanner.vel_linear_x)
+            # Stop at final destination.
+            if not self.navigator.bot_motionplanner.goal_not_reached_flag:
+                if not self.destination_reached:
+                    self.get_logger().info('Destination reached. Stopping vehicle.')
+                    self.destination_reached = True
+                self.velocity.angular.z = 0.0
+                self.velocity.linear.x = 0.0
+
+            self.publisher.publish(self.velocity)
+            if config.debugging:
+                print('[GPS Cmd Debug] cmd_vel.linear.x={:.3f} cmd_vel.angular.z={:.3f} gps_z={:.3f} lane_z={:.3f} lane_valid={} car_turning={}'.format(
+                    self.velocity.linear.x, self.velocity.angular.z,
+                    self.navigator.bot_motionplanner.vel_angular_z, lane_angle,
+                    lane_valid, self.navigator.bot_motionplanner.car_turning))
+            try:
+                cv2.destroyWindow("Frame")
+            except:
+                pass
+            return
+
+        # Lane/road-following mode only when GPS Nav is disabled.
+        Angle,Speed,self.prius_dashcam = self.Car.driveCar(frame)
 
         # if engines_on normal mode,
         #   else stop car
         if config.engines_on:
-            # [NEW]: Sat-Nav only influences steering in case of sharp turns
-            if (config.enable_SatNav and self.navigator.bot_motionplanner.car_turning):
-                self.velocity.angular.z = self.navigator.bot_motionplanner.vel_angular_z
-            else:
-                self.velocity.angular.z = Angle
+            self.velocity.angular.z = Angle
             self.velocity.linear.x = Speed
         else:
             self.velocity.angular.z = 0.0

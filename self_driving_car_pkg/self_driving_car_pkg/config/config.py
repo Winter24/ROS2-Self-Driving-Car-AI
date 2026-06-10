@@ -26,6 +26,34 @@ debugging_TL_Config = True
 # Adding functionality to toggle Sat_Nav on/off
 enable_SatNav = False
 
+# In GPS Nav mode, front-camera road following owns steering whenever the lane
+# mask is valid. GPS only supplies route progress and fallback when vision is
+# lost, so it cannot fight the camera correction on straight lane-centering.
+gps_lane_assist_enabled = True
+gps_lane_assist_weight = 1.00
+gps_lane_assist_gps_bias_weight = 0.0
+gps_lane_assist_max_angular = 0.55
+gps_lane_assist_disable_above_gps_turn = 99.0
+gps_lane_assist_speed_cap = 0.50
+gps_lane_assist_camera_speed = 0.80
+gps_lane_assist_gps_fallback_speed = 0.25
+gps_nav_max_angular_cmd = 1.00
+
+# Camera road-centering sensitivity. The previous controller used half of the
+# image width, making even a clear road-center error produce a tiny correction.
+lane_center_max_dist_px = 70
+lane_distance_weight = 0.80
+lane_curvature_weight = 0.20
+road_min_width_ratio = 0.35
+
+# Black-road segmentation thresholds for city GPS lane assist. Use a strict
+# dark+low-saturation mask so gray curbs and yellow/green shoulders are not
+# treated as drivable asphalt.
+road_black_max_hls_l = 62
+road_black_max_hls_s = 110
+road_black_max_hsv_v = 85
+road_black_max_hsv_s = 95
+
 # [NEW]: Control switch to turn steering animation on/off
 animate_steering = False
 

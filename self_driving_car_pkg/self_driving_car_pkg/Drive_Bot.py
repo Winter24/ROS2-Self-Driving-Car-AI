@@ -1,6 +1,4 @@
 from .Detection.Lanes.Lane_Detection import detect_Lane
-from .Detection.Signs.SignDetectionApi import detect_Signs
-from .Detection.TrafficLights.TrafficLights_Detection import detect_TrafficLights
 import cv2
 from numpy import interp
 from .config import config
@@ -166,6 +164,8 @@ class Control:
 
         # [NEW]: Deque member variable created for emulating rolling average filter to get smoothed Lane's ASsist
         self.angle_queue = deque(maxlen=10)
+        self.control_debug_counter = 0
+        self.lane_valid = False
 
     def follow_Lane(self,Max_Sane_dist,distance,curvature , Mode , Tracked_class):
 
@@ -184,8 +184,8 @@ class Control:
 
         self.prev_Mode = Mode # Set prevMode to current Mode
 
-        Max_turn_angle_neg = -90
-        Max_turn_angle = 90
+        Max_turn_angle_neg = -45
+        Max_turn_angle = 45
 
         CarTurn_angle = 0
 
@@ -203,7 +203,9 @@ class Control:
             Turn_angle_interpolated = interp(distance,[-Max_Sane_dist,Max_Sane_dist],[-90,90])
             #[NEW]: Modified to calculate carturn_angle based on following criteria
             #             65% turn suggested by distance to the lane center + 35 % how much the lane is turning
-            CarTurn_angle = (0.65*Turn_angle_interpolated) + (0.35*curvature)
+            dist_w = float(getattr(config, "lane_distance_weight", 0.80))
+            curv_w = float(getattr(config, "lane_curvature_weight", 0.20))
+            CarTurn_angle = (dist_w * Turn_angle_interpolated) + (curv_w * curvature)
 
         # Handle Max Limit [if (greater then either limits) --> set to max limit]
         if( (CarTurn_angle > Max_turn_angle) or (CarTurn_angle < (-1 *Max_turn_angle) ) ):
@@ -214,7 +216,7 @@ class Control:
 
         #angle = CarTurn_angle
         # [NEW]: Increase car turning capability by 30 % to accomodate sharper turns
-        angle = interp(CarTurn_angle,[-90,90],[-60,60])
+        angle = interp(CarTurn_angle,[-45,45],[-25,25])
 
         curr_speed = self.car_speed
 
@@ -306,16 +308,33 @@ class Control:
         current_speed = 0
 
         if((Distance != -1000) and (Curvature != -1000)):
+            self.lane_valid = True
 
             # [NEW]: Very Important: Minimum Sane Distance that a car can be from the perfect lane to follow is increased to half its fov.
             #                        This means sharp turns only in case where we are way of target XD
-            self.angle_of_car , current_speed = self.follow_Lane(int(frame_disp.shape[1]/2), Distance,Curvature , Mode , Tracked_class )
+            max_sane_dist = int(getattr(config, "lane_center_max_dist_px", int(frame_disp.shape[1] / 4)))
+            self.angle_of_car , current_speed = self.follow_Lane(max_sane_dist, Distance,Curvature , Mode , Tracked_class )
+        else:
+            self.lane_valid = False
+            # Do not keep the previous steering command when vision fails. The
+            # old behavior left the rolling-average queue full of the last turn
+            # value, so after losing the road mask the car kept rotating into
+            # the curb/lane edge.
+            self.angle_queue.clear()
+            self.angle_of_car = 0.0
+            current_speed = self.car_speed
         # [NEW]: Keeping track of orig steering angle and smoothed steering angle using rolling average
         config.angle_orig = self.angle_of_car
         # Rolling average applied to get smoother steering angles for robot
         self.angle_queue.append(self.angle_of_car)
         self.angle_of_car = (sum(self.angle_queue)/len(self.angle_queue))
         config.angle = self.angle_of_car
+
+        self.control_debug_counter += 1
+        if self.control_debug_counter % 15 == 0:
+            print("[LaneControl Debug] Distance={} Curvature={:.2f} raw_angle={:.2f} smooth_angle={:.2f} speed={:.2f}".format(
+                Distance, Curvature, config.angle_orig, self.angle_of_car, current_speed))
+
         if Inc_LT:
             self.angle_of_car,current_speed, Detected_LeftTurn, Activat_LeftTurn = self.Obey_LeftTurn(self.angle_of_car,current_speed,Mode,Tracked_class)
         else:
@@ -337,43 +356,17 @@ class Car:
         # [NEW]: Containers to Keep track of current state of Signs and Traffic Light detection
         self.Tracked_class = "Unknown"
         self.Traffic_State = "Unknown"
+        self.cmd_debug_counter = 0
 
     def display_state(self,frame_disp,angle_of_car,current_speed,Tracked_class,Traffic_State,Detected_LeftTurn, Activat_LeftTurn):
+        """Keep camera frame clean.
 
-        ###################################################  Displaying CONTROL STATE ####################################
-
-        if (angle_of_car <-10):
-            direction_string="[ Left ]"
-            color_direction=(120,0,255)
-        elif (angle_of_car >10):
-            direction_string="[ Right ]"
-            color_direction=(120,0,255)
-        else:
-            direction_string="[ Straight ]"
-            color_direction=(0,255,0)
-
-        if(current_speed>0):
-            direction_string = "Moving --> "+ direction_string
-        else:
-            color_direction=(0,0,255)
-
-
-        cv2.putText(frame_disp,str(direction_string),(20,40),cv2.FONT_HERSHEY_DUPLEX,0.4,color_direction,1)
-
-        angle_speed_str = "[ Angle ,Speed ] = [ " + str(int(angle_of_car)) + "deg ," + str(int(current_speed)) + "mph ]"
-        cv2.putText(frame_disp,str(angle_speed_str),(20,20),cv2.FONT_HERSHEY_DUPLEX,0.4,(0,0,255),1)
-
-        cv2.putText(frame_disp,"Traffic Light State = [ "+Traffic_State+" ] ",(20,60),cv2.FONT_HERSHEY_COMPLEX,0.35,255)
-
-        if (Tracked_class=="left_turn"):
-            font_Scale = 0.32
-            if (Detected_LeftTurn):
-                Tracked_class = Tracked_class + " : Detected { True } "
-            else:
-                Tracked_class = Tracked_class + " : Activated { "+ str(Activat_LeftTurn) + " } "
-        else:
-            font_Scale = 0.37
-        cv2.putText(frame_disp,"Sign Detected ==> "+str(Tracked_class),(20,80),cv2.FONT_HERSHEY_COMPLEX,font_Scale,(0,255,255),1)
+        Old code wrote Angle/Speed/TrafficLight/Sign text directly on the
+        dashcam frame. This made the GPS UI Bot View hard to read. The steering
+        wheel/speedometer overlay is drawn separately in GPS_Navigation
+        utilities_disp.draw_bot_speedo(), so no text is needed here.
+        """
+        return
 
     def driveCar(self,frame):
 
@@ -397,12 +390,20 @@ class Car:
         distance, Curvature = detect_Lane(img)
 
         if self.Inc_TL:
+            from .Detection.TrafficLights.TrafficLights_Detection import detect_TrafficLights
             Traffic_State, CloseProximity = detect_TrafficLights(img_orig.copy(),img)
         else:
             Traffic_State = "Unknown"
             CloseProximity = False
 
-        Mode , Tracked_class = detect_Signs(img_orig,img)
+        # City world does not have traffic signs by default. When sign handling is
+        # disabled, do not run Sign Detection / Sign Classification at all.
+        if self.Inc_LT:
+            from .Detection.Signs.SignDetectionApi import detect_Signs
+            Mode , Tracked_class = detect_Signs(img_orig,img)
+        else:
+            Mode = "Detection"
+            Tracked_class = "Unknown"
 
         Current_State = [distance, Curvature, img, Mode, Tracked_class, Traffic_State, CloseProximity]
 
@@ -421,5 +422,9 @@ class Car:
             Speed=interp(Speed,[30,90],[0.3,0.8])
 
         Speed = float(Speed)
+
+        self.cmd_debug_counter += 1
+        if self.cmd_debug_counter % 15 == 0:
+            print("[Cmd Debug] cmd_vel.linear.x={:.3f} cmd_vel.angular.z={:.3f}".format(Speed, Angle))
 
         return Angle, Speed, img

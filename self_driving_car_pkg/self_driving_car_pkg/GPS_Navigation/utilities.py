@@ -77,8 +77,29 @@ def click_event(event, x, y, flags, params):
     # checking for left mouse clicks
     if event == cv2.EVENT_LBUTTONDOWN:
 
-        # displaying the coordinates
-        # on the Shell
+        # New UI displays sat_view directly, so window click == sat_view click.
+        if isinstance(params, dict):
+            sat_w = params.get("sat_w", None)
+            sat_h = params.get("sat_h", None)
+            view = params.get("view", None)
+            window_name = params.get("window_name", "Mark your destination!!!")
+            marker_text = params.get("marker_text", "DEST")
+
+            print("[GPS Click Debug] selected on sat_view   = ({}, {})".format(x, y))
+            if sat_w is not None and sat_h is not None:
+                print("[GPS Click Debug] sat_view size         = {}x{}".format(sat_w, sat_h))
+                if x < 0 or y < 0 or x >= sat_w or y >= sat_h:
+                    print("[GPS Click Debug] WARNING: click is outside sat_view/map area; ignored.")
+                    return
+
+            # Draw marker on the clicked point for visual confirmation.
+            if view is not None:
+                cv2.circle(view, (x, y), 8, (0, 0, 255), -1)
+                cv2.circle(view, (x, y), 14, (255, 255, 255), 2)
+                cv2.putText(view, marker_text, (x + 16, max(20, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
+                cv2.imshow(window_name, view)
+
+        # Store sat_view coordinates directly.
         config.destination = (x,y)
 
 # [NEW]: Transform point to new Frame of Refrence [described by provided rot and translation tranformations]
@@ -246,5 +267,4 @@ class Debugging:
                 cv2.destroyWindow('CONFIG_LIVE')
             except:
                 pass  
-
 

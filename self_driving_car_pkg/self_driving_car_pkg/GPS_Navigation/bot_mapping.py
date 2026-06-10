@@ -25,12 +25,26 @@ Date :
 '''
 import cv2
 import numpy as np
+import os
 
 from . import config
 # Importing utility functions to help in estimating start and end for graph
 from .utilities import closest_node,get_centroid
 draw_intrstpts = True
 debug_mapping = False
+
+def _gps_viz(name, img):
+    if not getattr(config, "visualize_pipeline", False):
+        return
+    try:
+        os.makedirs(getattr(config, "visualize_pipeline_dir", "/tmp/gps_nav_debug"), exist_ok=True)
+        cv2.imwrite(os.path.join(config.visualize_pipeline_dir, name + ".png"), img)
+        cv2.namedWindow("GPS DEBUG - " + name, cv2.WINDOW_NORMAL)
+        cv2.imshow("GPS DEBUG - " + name, img)
+        cv2.waitKey(1)
+    except Exception as e:
+        print("[GPS Viz Debug] failed", name, e)
+
 
 
 def thinning(binary_img):
@@ -66,15 +80,22 @@ class Graph():
     #      Otherwise add connection
     def add_vertex(self,vertex,neighbor= None,case = None, cost = None):
         
-        # If neighbor is present ==> Add connection
-        if vertex in self.graph.keys():
-            self.graph[vertex][neighbor] = {}
-            self.graph[vertex][neighbor]["case"] = case
-            self.graph[vertex][neighbor]["cost"] = cost
-        else:
-            # Adding vertex to graph
+        # Ensure the vertex exists first.
+        if vertex not in self.graph.keys():
             self.graph[vertex] = {}
             self.graph[vertex]["case"] = case
+
+        # If neighbor == None, just add/update the vertex case. Do NOT create a
+        # None neighbor, because path planners iterate graph[u] and expect every
+        # non-"case" key to be a valid vertex.
+        if neighbor is None:
+            self.graph[vertex]["case"] = case
+            return
+
+        # If neighbor is present ==> Add connection
+        self.graph[vertex][neighbor] = {}
+        self.graph[vertex][neighbor]["case"] = case
+        self.graph[vertex][neighbor]["cost"] = cost
 
     # Function to display complete graph
     def displaygraph(self):
@@ -519,26 +540,70 @@ class bot_mapper():
             # Step 3: Crop out Boundary that is not part of maze
             thinned_cropped = thinned[self.crp_amt:thinned.shape[0]-self.crp_amt,
                                       self.crp_amt:thinned.shape[1]-self.crp_amt]
+            _gps_viz("01_skeleton_road", cv2.cvtColor(thinned_cropped, cv2.COLOR_GRAY2BGR))
 
             # [NEW]: Estimating start and destination on roadnetwork
             #        from bot_location provided by localization module and destination_loc
             #        provided by user
             if bot_loc!=[]:
-                road_cnts = cv2.findContours(thinned_cropped, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[1]
+                # Use ALL skeleton road pixels for snapping start/end. The old code
+                # only used road_cnts[0], which can represent a single contour/branch
+                # and can incorrectly snap both start and destination to the same point.
+                road_ys, road_xs = np.where(thinned_cropped > 0)
+                if road_xs.size == 0:
+                    print("[GPS Mapping Debug] ERROR: no road skeleton pixels found")
+                    return
+                road_pts = np.column_stack((road_xs, road_ys))  # (x=col, y=row)
 
-                # Estimating start as the closest road to car
-                closest_idx = closest_node(bot_loc,road_cnts[0])
-                start = (road_cnts[0][closest_idx][0][0],road_cnts[0][closest_idx][0][1])
+                bot_loc_in = tuple(bot_loc)
+                destination_in = tuple(destination)
 
-                # Estimating end as the closest road to destination
-                closest_idx = closest_node(destination,road_cnts[0])
-                end = (road_cnts[0][closest_idx][0][0],road_cnts[0][closest_idx][0][1])
+                # thinned_cropped is maze_og with crp_amt pixels removed from
+                # each side. bot_loc and destination are in the full rotated
+                # maze_og frame, so convert them into the cropped frame before
+                # nearest-neighbor snapping. Without this, start/end are shifted
+                # and can snap to the wrong road branch.
+                bot_q_uncropped = (bot_loc_in[0] - self.crp_amt, bot_loc_in[1] - self.crp_amt)
+                dst_q_uncropped = (destination_in[0] - self.crp_amt, destination_in[1] - self.crp_amt)
+
+                # Clamp query points into image bounds before nearest-neighbor snap.
+                bot_q = (int(np.clip(bot_q_uncropped[0], 0, thinned_cropped.shape[1]-1)),
+                         int(np.clip(bot_q_uncropped[1], 0, thinned_cropped.shape[0]-1)))
+                dst_q = (int(np.clip(dst_q_uncropped[0], 0, thinned_cropped.shape[1]-1)),
+                         int(np.clip(dst_q_uncropped[1], 0, thinned_cropped.shape[0]-1)))
+
+                closest_idx = closest_node(bot_q, road_pts)
+                start = (int(road_pts[closest_idx][0]), int(road_pts[closest_idx][1]))
+
+                closest_idx = closest_node(dst_q, road_pts)
+                end = (int(road_pts[closest_idx][0]), int(road_pts[closest_idx][1]))
+
+                print("[GPS Mapping Debug] graphify input bot/dst      =", bot_loc_in, destination_in)
+                print("[GPS Mapping Debug] graphify clamped bot/dst    =", bot_q, dst_q)
+                print("[GPS Mapping Debug] thinned_cropped shape h,w   =", thinned_cropped.shape[0], thinned_cropped.shape[1])
+                print("[GPS Mapping Debug] nearest skeleton start/end  =", start, end)
+
+                # If snapped start/end are identical, try to keep the destination as
+                # the nearest road pixel among points reasonably far from start.
+                if start == end and road_pts.shape[0] > 1:
+                    d2_start = np.sum((road_pts - np.array(start))**2, axis=1)
+                    far_pts = road_pts[d2_start > 50**2]
+                    if far_pts.size > 0:
+                        closest_idx = closest_node(dst_q, far_pts)
+                        end = (int(far_pts[closest_idx][0]), int(far_pts[closest_idx][1]))
+                        print("[GPS Mapping Debug] start==end; re-snapped end  =", end)
 
                 # Visualizing start and end
                 thinned_bgr = cv2.cvtColor(thinned_cropped, cv2.COLOR_GRAY2BGR)
-                cv2.circle(thinned_bgr, bot_loc, 5, (0,0,255))
-                cv2.circle(thinned_bgr, start, 1, (128,0,255),1)
-                cv2.circle(thinned_bgr, end, 15, (0,255,0),3)
+                cv2.circle(thinned_bgr, bot_q, 5, (0,0,255), -1)
+                cv2.circle(thinned_bgr, dst_q, 5, (255,0,255), -1)
+                cv2.circle(thinned_bgr, start, 8, (255,0,0), 2)
+                cv2.circle(thinned_bgr, end, 12, (0,255,0), 3)
+                cv2.putText(thinned_bgr, "bot_q", (bot_q[0]+8, bot_q[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,255), 1)
+                cv2.putText(thinned_bgr, "dst_q", (dst_q[0]+8, dst_q[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,0,255), 1)
+                cv2.putText(thinned_bgr, "START snap", (start[0]+8, start[1]+15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,0,0), 1)
+                cv2.putText(thinned_bgr, "END snap", (end[0]+8, end[1]-8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,0), 1)
+                _gps_viz("02_snap_start_end", thinned_bgr)
 
             # Step 4: Overlay found path on Maze Occupency Grid.
             extracted_maze_cropped = extracted_maze[self.crp_amt:extracted_maze.shape[0]-self.crp_amt,
@@ -548,6 +613,45 @@ class bot_mapper():
             
             # Step 5: Identify Interest Points in the path to further reduce processing time
             self.one_pass(thinned_cropped,start,end)
+
+            # Robustness fix: sometimes the user destination is snapped to a road
+            # pixel but one_pass() does not register it as Graph.end, leaving
+            # Graph.end == 0 and causing path planning to crash with KeyError: 0.
+            # Force-add the snapped start/end points and connect them if needed.
+            if self.Graph.start == 0:
+                start_row, start_col = start[1], start[0]
+                print("[GPS Mapping Debug] WARNING: Graph.start was not set by one_pass(); force-adding", (start_row, start_col))
+                self.Graph.add_vertex((start_row, start_col), case="_Start_")
+                self.Graph.start = (start_row, start_col)
+                self.reset_connct_paramtrs()
+                self.connect_neighbors(thinned_cropped, start_row, start_col, "_Start_")
+
+            if self.Graph.end == 0:
+                end_row, end_col = end[1], end[0]
+                print("[GPS Mapping Debug] WARNING: Graph.end was not set by one_pass(); force-adding", (end_row, end_col))
+                self.Graph.add_vertex((end_row, end_col), case="_End_")
+                self.Graph.end = (end_row, end_col)
+                self.reset_connct_paramtrs()
+                self.connect_neighbors(thinned_cropped, end_row, end_col, "_End_")
+
+            print("[GPS Mapping Debug] snapped start/end on road =", start, end)
+            print("[GPS Mapping Debug] Graph.start/end          =", self.Graph.start, self.Graph.end)
+            graph_viz = cv2.cvtColor(thinned_cropped, cv2.COLOR_GRAY2BGR)
+            for u, nbrs in self.Graph.graph.items():
+                if not isinstance(u, tuple):
+                    continue
+                up = (int(u[1]), int(u[0]))
+                cv2.circle(graph_viz, up, 2, (0, 255, 255), -1)
+                for v in nbrs:
+                    if v == "case" or not isinstance(v, tuple):
+                        continue
+                    vp = (int(v[1]), int(v[0]))
+                    cv2.line(graph_viz, up, vp, (80, 80, 255), 1)
+            if self.Graph.start != 0:
+                cv2.circle(graph_viz, (self.Graph.start[1], self.Graph.start[0]), 9, (255,0,0), 2)
+            if self.Graph.end != 0:
+                cv2.circle(graph_viz, (self.Graph.end[1], self.Graph.end[0]), 12, (0,255,0), 2)
+            _gps_viz("03_graph_nodes_edges", graph_viz)
             #cv2.waitKey(0)
             self.maze = thinned_cropped
             self.graphified = True

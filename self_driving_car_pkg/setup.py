@@ -61,6 +61,7 @@ setup(
         'video_save = self_driving_car_pkg.video_save:main',
         'upper_camera_recording = self_driving_car_pkg.upper_camera_video:main',
         'sdc_V2 = self_driving_car_pkg.sdc_V2:main',
+        'gps_waypoint_editor = self_driving_car_pkg.waypoint_editor:main',
         ],
     },
 )
